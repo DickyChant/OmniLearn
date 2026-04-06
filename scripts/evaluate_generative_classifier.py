@@ -33,6 +33,8 @@ def parse_arguments():
     parser.add_argument("--freeze_body", action='store_true', help="Use PEFT checkpoint (frozen body)")
     parser.add_argument("--freeze_heads", action='store_true', help="Frozen heads checkpoint")
     parser.add_argument("--lora_rank", type=int, default=0, help="LoRA rank for body adaptation (0=disabled)")
+    parser.add_argument("--nevts", type=int, default=50000,
+                        help="Max test events to load (caps memory usage)")
     parser.add_argument("--pretrained_only", action='store_true',
                         help="Evaluate pretrained JetClass checkpoint directly (no fine-tuning, untrained baseline)")
     args = parser.parse_args()
@@ -126,6 +128,13 @@ def get_data_info(flags):
                                         flags.batch)
         threshold = [0.5]
         folder_name = 'JetClass/test'
+
+    # Cap number of test events to avoid OOM
+    if flags.nevts and flags.nevts < len(test.X):
+        test.X = test.X[:flags.nevts]
+        test.y = test.y[:flags.nevts]
+        test.jet = test.jet[:flags.nevts]
+        test.mask = test.mask[:flags.nevts]
 
     return test, multi_label, threshold, folder_name
 
