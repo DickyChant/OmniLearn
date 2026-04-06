@@ -30,6 +30,11 @@ def parse_arguments():
     parser.add_argument("--weighting", type=str, default="uniform", choices=["uniform", "snr"],
                         help="Timestep weighting: uniform or SNR-weighted ELBO")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--freeze_body", action='store_true', help="Use PEFT checkpoint (frozen body)")
+    parser.add_argument("--freeze_heads", action='store_true', help="Frozen heads checkpoint")
+    parser.add_argument("--lora_rank", type=int, default=0, help="LoRA rank for body adaptation (0=disabled)")
+    parser.add_argument("--pretrained_only", action='store_true',
+                        help="Evaluate pretrained JetClass checkpoint directly (no fine-tuning, untrained baseline)")
     args = parser.parse_args()
     return args
 
@@ -233,17 +238,35 @@ def evaluate_classifier_head(model, X_dataset):
     return tf.nn.softmax(logits).numpy()
 
 
+def build_add_string(flags):
+    """Build checkpoint add_string matching the naming convention in train.py."""
+    add_string = ""
+    if flags.nid > 0:
+        add_string += "_{}".format(flags.nid)
+    if flags.freeze_body:
+        add_string += "_peft"
+    if flags.freeze_heads:
+        add_string += "_frozenheads"
+    if flags.lora_rank > 0:
+        add_string += "_lora{}".format(flags.lora_rank)
+    return add_string
+
+
 def main():
     utils.setup_gpus()
     flags = parse_arguments()
 
     test, multi_label, thresholds, folder_name = get_data_info(flags)
 
+    add_string = build_add_string(flags)
+    if flags.pretrained_only:
+        npy_suffix = "_pretrained_only_generative.npy"
+    else:
+        npy_suffix = "_generative.npy"
     npy_file = os.path.join(flags.folder, folder_name, 'npy', '{}'.format(
         utils.get_model_name(
             flags, fine_tune=flags.fine_tune,
-            add_string='_{}'.format(flags.nid) if flags.nid > 0 else '').replace(
-                '.weights.h5', '_generative.npy')))
+            add_string=add_string).replace('.weights.h5', npy_suffix)))
 
     if flags.load:
         if hvd.rank() == 0:
@@ -253,6 +276,7 @@ def main():
         gen_scores = data['gen_scores']
         cls_pred = data.get('cls_pred', None)
     else:
+        # Build model with target dataset dimensions (e.g. top: 2 classes)
         model = PET(num_feat=test.num_feat,
                     num_jet=test.num_jet,
                     num_classes=test.num_classes,
@@ -261,31 +285,48 @@ def main():
                     drop_probability=flags.drop_probability,
                     simple=flags.simple, layer_scale=flags.layer_scale,
                     talking_head=flags.talking_head,
-                    mode=flags.mode)
+                    mode=flags.mode,
+                    freeze_body=flags.freeze_body,
+                    freeze_heads=flags.freeze_heads,
+                    lora_rank=flags.lora_rank)
 
         X, y = test.make_eval_data()
-        add_string = '_{}'.format(flags.nid) if flags.nid > 0 else ''
 
-        model.load_weights(os.path.join(
-            flags.folder, 'checkpoints',
-            utils.get_model_name(flags, fine_tune=flags.fine_tune, add_string=add_string)))
+        # Mark model as built so load_weights works on the subclassed model.
+        model.built = True
 
-        # --- Classifier head evaluation ---
-        cls_pred = None
-        if 'all' in flags.mode or flags.mode == 'classifier':
+        if flags.pretrained_only:
+            # Load JetClass pretrained checkpoint directly; skip mismatched layers
+            # (classifier output + generator label embedding won't match due to num_classes)
+            pretrained_name = utils.get_model_name(
+                flags, fine_tune=flags.fine_tune).replace(
+                    flags.dataset, 'jetclass').replace(
+                        'fine_tune', 'baseline').replace(flags.mode, 'all')
+            pretrained_path = os.path.join(flags.folder, 'checkpoints', pretrained_name)
             if hvd.rank() == 0:
-                print("\nRunning classifier head evaluation...")
-            cls_pred = evaluate_classifier_head(model, X)
-            cls_pred = hvd.allgather(tf.constant(cls_pred)).numpy()
+                print(f"Loading pretrained JetClass checkpoint: {pretrained_name}")
+                print("  (head layers with mismatched shapes will be randomly initialized)")
+            model.load_weights(pretrained_path, by_name=True, skip_mismatch=True)
+        else:
+            checkpoint_name = utils.get_model_name(
+                flags, fine_tune=flags.fine_tune, add_string=add_string)
+            if hvd.rank() == 0:
+                print(f"Loading checkpoint: {checkpoint_name}")
+            model.load_weights(os.path.join(flags.folder, 'checkpoints', checkpoint_name))
 
-        # --- Generative classification ---
+        # --- Always run BOTH evaluation methods ---
+        # Even if only one head was trained, we want to compare both methods
+        # (the untrained head gives us a baseline for comparison).
+        if hvd.rank() == 0:
+            print("\nRunning classifier head evaluation...")
+        cls_pred = evaluate_classifier_head(model, X)
+        cls_pred = hvd.allgather(tf.constant(cls_pred)).numpy()
+
         if hvd.rank() == 0:
             print(f"\nRunning generative classification (T={flags.num_timesteps}, weighting={flags.weighting})...")
         gen_losses = compute_generative_losses(
             model, X, test.num_classes, flags.num_timesteps, flags.weighting, flags.seed)
         gen_losses = hvd.allgather(tf.constant(gen_losses)).numpy()
-
-        # Convert losses to probability scores: lower loss = higher likelihood
         gen_scores = softmax(-gen_losses, axis=-1)
 
         y = hvd.allgather(tf.constant(y)).numpy()
@@ -295,7 +336,10 @@ def main():
             save_dir = os.path.join(flags.folder, folder_name, 'npy')
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
-            save_data = {'y': y, 'gen_scores': gen_scores, 'gen_losses': gen_losses}
+            save_data = {'y': y}
+            if gen_scores is not None:
+                save_data['gen_scores'] = gen_scores
+                save_data['gen_losses'] = gen_losses
             if cls_pred is not None:
                 save_data['cls_pred'] = cls_pred
             np.save(npy_file, save_data)
@@ -311,13 +355,14 @@ def main():
             else:
                 print_metrics(cls_pred[:, 1], y[:, 1], thresholds, multi_label=False)
 
-        print("\n" + "=" * 50)
-        print(f"=== Generative Classification (T={flags.num_timesteps}, {flags.weighting}) ===")
-        print("=" * 50)
-        if multi_label:
-            print_metrics(gen_scores, y, thresholds, multi_label=True)
-        else:
-            print_metrics(gen_scores[:, 1], y[:, 1], thresholds, multi_label=False)
+        if gen_scores is not None:
+            print("\n" + "=" * 50)
+            print(f"=== Generative Classification (T={flags.num_timesteps}, {flags.weighting}) ===")
+            print("=" * 50)
+            if multi_label:
+                print_metrics(gen_scores, y, thresholds, multi_label=True)
+            else:
+                print_metrics(gen_scores[:, 1], y[:, 1], thresholds, multi_label=False)
 
 
 if __name__ == '__main__':

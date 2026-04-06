@@ -38,6 +38,9 @@ def parse_arguments():
     parser.add_argument("--simple", action='store_true', default=False, help='Use simplified head model')
     parser.add_argument("--talking_head", action='store_true', default=False, help='Use talking head attention')
     parser.add_argument("--layer_scale", action='store_true', default=False, help='Use layer scale in the residual connections')
+    parser.add_argument("--freeze_body", action='store_true', default=False, help='Freeze body (PEFT: only train heads)')
+    parser.add_argument("--freeze_heads", action='store_true', default=False, help='Freeze heads (train only LoRA body)')
+    parser.add_argument("--lora_rank", type=int, default=0, help='LoRA rank for body adaptation (0=disabled)')
     return parser.parse_args()
 
 def get_data_loader(flags):
@@ -100,11 +103,20 @@ def main():
                 drop_probability=flags.drop_probability,
                 simple=flags.simple, layer_scale=flags.layer_scale,
                 talking_head=flags.talking_head,
-                mode=flags.mode)
+                mode=flags.mode,
+                freeze_body=flags.freeze_body,
+                freeze_heads=flags.freeze_heads,
+                lora_rank=flags.lora_rank)
 
 
     if flags.fine_tune:
         if hvd.rank()==0:
+            # Trigger variable creation so load_weights works on subclassed model
+            # Mark model as built so load_weights works on the subclassed model.
+            # All sub-models (body, classifier_head, generator_head) are Functional
+            # and already built in __init__, so weights exist — we just need the flag.
+            model._is_compiled = True
+            model.built = True
             model_name = utils.get_model_name(flags,flags.fine_tune).replace(flags.dataset,'jetclass').replace('fine_tune','baseline').replace(flags.mode,'all')
             model_path = os.path.join(flags.folder, 'checkpoints', model_name)
             logger.info(f"Loading model weights from {model_path}")
@@ -123,8 +135,17 @@ def main():
     ]
 
     if hvd.rank() == 0:
+        add_string = ""
+        if flags.nid > 0:
+            add_string += "_{}".format(flags.nid)
+        if flags.freeze_body:
+            add_string += "_peft"
+        if flags.freeze_heads:
+            add_string += "_frozenheads"
+        if flags.lora_rank > 0:
+            add_string += "_lora{}".format(flags.lora_rank)
         checkpoint_name = utils.get_model_name(flags,flags.fine_tune,
-                                               add_string="_{}".format(flags.nid) if flags.nid>0 else '')
+                                               add_string=add_string)
         checkpoint_path = os.path.join(flags.folder, 'checkpoints', checkpoint_name)
         checkpoint_callback = keras.callbacks.ModelCheckpoint(checkpoint_path,
                                                               save_best_only=True,mode='auto',

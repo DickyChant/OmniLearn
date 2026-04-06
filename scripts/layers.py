@@ -22,8 +22,13 @@ class StochasticDepth(layers.Layer):
                 shape, minval=0, maxval=1)
             random_tensor = tf.floor(random_tensor)
             return x * random_tensor
-        
+
         return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'drop_prob': self.drop_prob})
+        return config
 
 
 class RandomDrop(layers.Layer):
@@ -36,14 +41,19 @@ class RandomDrop(layers.Layer):
     def call(self, x, training=False):
         if training:
             keep_prob = 1 - self.drop_prob
-            shape = (tf.shape(x)[0],1) 
+            shape = (tf.shape(x)[0],1)
             random_tensor = keep_prob + tf.random.uniform(
                 shape, minval=0, maxval=1)
             random_tensor = tf.floor(random_tensor)
             x[:,:,self.num_skip:] = x[:,:,self.num_skip:] * random_tensor[:,None]
             return x
-        
+
         return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'drop_prob': self.drop_prob, 'num_skip': self.num_skip})
+        return config
 
     
 class SimpleHeadAttention(layers.Layer):
@@ -109,6 +119,12 @@ class SimpleHeadAttention(layers.Layer):
         x = self.proj(x)
         x = self.proj_drop(x, training=training)
         return x, attn
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'projection_dim': self.projection_dim, 'num_heads': self.num_heads,
+                       'dropout_rate': self.dropout_rate})
+        return config
 
 class TalkingHeadAttention(layers.Layer):
     """Talking-head attention as proposed in CaiT: https://arxiv.org/abs/2003.02436.
@@ -187,6 +203,36 @@ class TalkingHeadAttention(layers.Layer):
         x = self.proj_drop(x, training=training)
         return x, attn
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({'projection_dim': self.projection_dim, 'num_heads': self.num_heads,
+                       'dropout_rate': self.dropout_rate})
+        return config
+
+
+class LoRABypass(layers.Layer):
+    """Low-rank additive bypass for PEFT. Output is zero at initialization,
+    so the model starts identical to pretrained."""
+    def __init__(self, output_dim, rank, alpha=None, **kwargs):
+        super().__init__(**kwargs)
+        self.output_dim = output_dim
+        self.rank = rank
+        self.alpha = alpha if alpha is not None else float(rank)
+
+    def build(self, input_shape):
+        self.lora_down = self.add_weight(
+            'lora_down', (input_shape[-1], self.rank), initializer='he_normal')
+        self.lora_up = self.add_weight(
+            'lora_up', (self.rank, self.output_dim), initializer='zeros')
+
+    def call(self, x):
+        return tf.matmul(tf.matmul(x, self.lora_down), self.lora_up) * (self.alpha / self.rank)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'output_dim': self.output_dim, 'rank': self.rank, 'alpha': self.alpha})
+        return config
+
 
 class LayerScale(layers.Layer):
     def __init__(self, init_values, projection_dim, **kwargs):
@@ -211,4 +257,9 @@ class LayerScale(layers.Layer):
             return inputs * self.gamma* mask
         else:
             return inputs * self.gamma
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'init_values': self.init_values, 'projection_dim': self.projection_dim})
+        return config
 

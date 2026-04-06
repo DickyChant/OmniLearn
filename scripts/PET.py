@@ -2,31 +2,39 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.models import Model
 from tensorflow.keras import layers
-from layers import StochasticDepth, TalkingHeadAttention, LayerScale, RandomDrop
+from layers import StochasticDepth, TalkingHeadAttention, LayerScale, RandomDrop, LoRABypass
 from tensorflow.keras.losses import mse, categorical_crossentropy
+
+# TF 2.9 compat: GroupNormalization lives in tfa, not keras.layers
+if not hasattr(layers, 'GroupNormalization'):
+    import tensorflow_addons as tfa
+    layers.GroupNormalization = tfa.layers.GroupNormalization
 
 
 class PET(keras.Model):
     """Point-Edge Transformer"""
     def __init__(self,
                  num_feat,
-                 num_jet,      
+                 num_jet,
                  num_classes=2,
                  num_keep = 7, #Number of features that wont be dropped
                  feature_drop = 0.1,
                  projection_dim = 128,
                  local = True, K = 10,
-                 num_local = 2, 
+                 num_local = 2,
                  num_layers = 8, num_class_layers=2,
                  num_gen_layers = 2,
                  num_heads = 4,drop_probability = 0.0,
                  simple = False, layer_scale = True,
-                 layer_scale_init = 1e-5,        
+                 layer_scale_init = 1e-5,
                  talking_head = False,
                  mode = 'classifier',
                  num_diffusion = 3,
                  dropout=0.0,
                  class_activation=None,
+                 freeze_body=False,
+                 freeze_heads=False,
+                 lora_rank=0,
                  ):
 
         super(PET, self).__init__()
@@ -46,8 +54,10 @@ class PET(keras.Model):
         self.num_diffusion = num_diffusion
         self.ema=0.999
         self.class_activation = class_activation
-        
-        
+        self.freeze_body = freeze_body
+        self.freeze_heads = freeze_heads
+        self.lora_rank = lora_rank
+
         input_features = layers.Input(shape=(None, num_feat), name='input_features')
         input_points = layers.Input(shape=(None, 2), name='input_points')
         input_mask = layers.Input((None,1),name = 'input_mask')
@@ -61,8 +71,9 @@ class PET(keras.Model):
                                      input_mask,
                                      input_time,
                                      local = local, K = K,
-                                     num_local = num_local, 
-                                     talking_head = talking_head)
+                                     num_local = num_local,
+                                     talking_head = talking_head,
+                                     lora_rank = lora_rank)
 
         self.body = keras.Model(inputs=[input_features,input_points,input_mask,input_time],
                                 outputs=outputs_body)
@@ -216,16 +227,22 @@ class PET(keras.Model):
             self.gen_tracker.update_state(loss_part)           
 
         
-        self.body_optimizer.minimize(loss,self.body.trainable_variables,tape=tape)
-        self.optimizer.minimize(loss,trainable_vars,tape=tape)
-
-
-        
-        for weight, ema_weight in zip(self.body.weights, self.ema_body.weights):
-            ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
-
-        for weight, ema_weight in zip(self.generator_head.weights, self.ema_generator_head.weights):
-            ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
+        if self.freeze_body:
+            if self.lora_rank > 0:
+                lora_vars = [v for v in self.body.trainable_variables if 'lora' in v.name]
+                if lora_vars:
+                    self.body_optimizer.minimize(loss, lora_vars, tape=tape)
+                    for w, ew in zip(self.body.weights, self.ema_body.weights):
+                        if 'lora' in w.name:
+                            ew.assign(self.ema * ew + (1 - self.ema) * w)
+        else:
+            self.body_optimizer.minimize(loss,self.body.trainable_variables,tape=tape)
+            for weight, ema_weight in zip(self.body.weights, self.ema_body.weights):
+                ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
+        if not self.freeze_heads:
+            self.optimizer.minimize(loss,trainable_vars,tape=tape)
+            for weight, ema_weight in zip(self.generator_head.weights, self.ema_generator_head.weights):
+                ema_weight.assign(self.ema * ema_weight + (1 - self.ema) * weight)
             
         return {m.name: m.result() for m in self.metrics}
     
@@ -308,6 +325,7 @@ class PET(keras.Model):
                  input_time,
                  local, K,num_local,
                  talking_head,
+                 lora_rank=0,
                  ):
 
 
@@ -344,15 +362,21 @@ class PET(keras.Model):
                 updates = layers.MultiHeadAttention(num_heads=self.num_heads,
                                                     key_dim=self.projection_dim//self.num_heads)(x1,x1)
 
+            if lora_rank > 0:
+                updates = layers.Add()([updates,
+                    LoRABypass(self.projection_dim, lora_rank, name=f'lora_attn_{i}')(x1)])
             if self.layer_scale:
                 updates = LayerScale(self.layer_scale_init, self.projection_dim)(updates,input_mask)
             updates = StochasticDepth(self.drop_probability)(updates)
-            
+
             x2 = layers.Add()([updates,encoded])
             x3 = layers.GroupNormalization(groups=1)(x2)
             x3 = layers.Dense(2*self.projection_dim,activation="gelu")(x3)
             x3 = layers.Dropout(self.dropout)(x3)
             x3 = layers.Dense(self.projection_dim)(x3)
+            if lora_rank > 0:
+                x3 = layers.Add()([x3,
+                    LoRABypass(self.projection_dim, lora_rank, name=f'lora_ffn_{i}')(x2)])
             if self.layer_scale:
                 x3 = LayerScale(self.layer_scale_init, self.projection_dim)(x3,input_mask)
             x3 = StochasticDepth(self.drop_probability)(x3)
